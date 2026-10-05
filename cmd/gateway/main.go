@@ -15,12 +15,14 @@ func main() {
 	buf := flag.Int("buffer", 8, "每订阅者缓冲容量")
 	total := flag.Int("n", 30, "注入事件总数")
 	interval := flag.Duration("interval", 50*time.Millisecond, "事件注入间隔")
+	drain := flag.Duration("drain", 2*time.Second, "退订宽限时间（0=立即收敛，<0=默认值2s）")
 	flag.Parse()
 
 	cfg := gateway.Config{
 		RetainPerTopic:   *retain,
 		SubscriberBuffer: *buf,
 		Policy:           gateway.DropNewest,
+		DrainTimeout:     *drain,
 	}
 	broker := gateway.NewBroker(cfg)
 	src := gateway.NewSource(broker, "orders")
@@ -79,20 +81,37 @@ func main() {
 	} else {
 		fmt.Println("[resume] 意外：非法游标未被拒绝")
 	}
-	// 等待 slow 排空后再校验守恒
-	published := broker.LatestSeq("orders")
-	deadline := time.Now().Add(10 * time.Second)
-	for slow.Stats().Total() != published && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
+	// 优雅下线：退订 slow，宽限期内继续处理积压，到期未做完的计为收敛丢弃
+	fmt.Printf("[drain] 退订 slow，宽限 %v 收敛积压...\n", *drain)
+	broker.Unsubscribe("orders", "slow")
+	<-slow.Finalized()
+
+	// 会话最终账目：退订收敛后仍可查询
+	var rep gateway.SessionReport
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if r, ok := broker.SessionReport("orders", "slow"); ok {
+			rep = r
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	ss := slow.Stats()
-	fmt.Printf("[stats] slow: delivered=%d dropped=%d failed=%d total=%d (published=%d)\n",
-		ss.Delivered, ss.Dropped, ss.Failed, ss.Total(), published)
-	if ss.Total() == published {
+	published := broker.LatestSeq("orders")
+	fmt.Printf("[drain] slow 最终账目: delivered=%d failed=%d dropped=%d (背压=%d 收敛=%d) cursor=%d\n",
+		rep.Stats.Delivered, rep.Stats.Failed, rep.Stats.Dropped,
+		rep.Stats.DroppedBackpressure, rep.Stats.DroppedDrain, rep.Cursor)
+	if rep.Stats.Total() == published {
 		fmt.Println("[done] 守恒校验通过: delivered+dropped+failed == published")
 	} else {
-		fmt.Println("[done] 守恒校验失败!")
+		fmt.Printf("[done] 守恒校验失败! total=%d published=%d\n", rep.Stats.Total(), published)
 	}
+
+	// 主题聚合视角：含已离开订阅者的贡献
+	ts := broker.TopicStats("orders")
+	fmt.Printf("[stats] topic 聚合: published=%d delivered=%d dropped=%d(背压=%d 收敛=%d) failed=%d(在线=%d 宽限=%d) 活跃=%d 收敛中=%d 已离开会话=%d\n",
+		ts.Published, ts.Delivered, ts.Dropped, ts.DroppedBackpressure, ts.DroppedDrain,
+		ts.Failed, ts.FailedOnline, ts.FailedDrain,
+		ts.ActiveSubscribers, ts.DrainingSubscribers, ts.DepartedSessions)
 }
 
 func must(err error) {

@@ -24,11 +24,50 @@ const (
 
 // Stats 记录单个订阅者的投递统计。
 // 不变式：Delivered + Dropped + Failed == 应投递给该订阅者的消息总数。
+// 分类口径：
+//
+//	Dropped == DroppedBackpressure + DroppedDrain
+//	Failed  == FailedOnline + FailedDrain
 type Stats struct {
 	Delivered uint64 // 成功投递并被处理
-	Dropped   uint64 // 因缓冲满按策略丢弃
-	Failed    uint64 // 处理函数返回错误
+	Dropped   uint64 // 丢弃总数（背压丢弃 + 下线收敛丢弃）
+	Failed    uint64 // 处理失败总数（在线失败 + 宽限期内失败）
+
+	DroppedBackpressure uint64 // 缓冲满按策略丢弃（背压扛不住）
+	DroppedDrain        uint64 // 退订宽限期到期仍未处理而丢弃（下线收敛超时）
+	FailedOnline        uint64 // 在线期间处理函数返回错误
+	FailedDrain         uint64 // 退订宽限期内处理函数返回错误
 }
 
 // Total 返回三类计数之和。
 func (s Stats) Total() uint64 { return s.Delivered + s.Dropped + s.Failed }
+
+// SessionReport 是一次订阅会话收敛后的最终账目，会话下线后仍可查询。
+type SessionReport struct {
+	Topic  string
+	ID     string
+	Stats  Stats  // 会话最终统计（含丢弃/失败分类）
+	Cursor Cursor // 会话最后确认位置（最后一条成功处理消息的 Seq）
+}
+
+// TopicStats 是主题维度的聚合统计。
+// 聚合范围：当前活跃订阅者 + 正在收敛的订阅者 + 已离开订阅者的最终账目，
+// 已离开的订阅者其贡献被永久保留。
+type TopicStats struct {
+	Published uint64 // 主题累计发布条数
+
+	Delivered           uint64 // 所有会话合计成功
+	Dropped             uint64 // 所有会话合计丢弃
+	Failed              uint64 // 所有会话合计失败
+	DroppedBackpressure uint64 // 其中：背压丢弃
+	DroppedDrain        uint64 // 其中：下线收敛超时丢弃
+	FailedOnline        uint64 // 其中：在线期间失败
+	FailedDrain         uint64 // 其中：宽限期内失败
+
+	ActiveSubscribers   int    // 当前活跃订阅者数
+	DrainingSubscribers int    // 正在宽限收敛的订阅者数
+	DepartedSessions    uint64 // 已收敛完成的会话数
+}
+
+// Total 返回聚合口径下 成功+丢弃+失败 之和。
+func (t TopicStats) Total() uint64 { return t.Delivered + t.Dropped + t.Failed }

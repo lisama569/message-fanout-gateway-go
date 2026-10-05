@@ -30,7 +30,55 @@ Source (可控事件源) --> Broker --> topicLog (每主题保序日志, 固定�
 
   - `Delivered`：处理函数返回 nil。
   - `Failed`：处理函数返回 error（cursor 不推进）。
-  - `Dropped`：缓冲满时按策略丢弃（见下）。
+  - `Dropped`：缓冲满时按策略丢弃（见下），或退订宽限期到期仍未处理（见「优雅下线」）。
+
+### 丢弃与失败的分类口径
+
+`Stats` 在总计之外提供分类计数，事后可区分一条消息的去向：
+
+```
+Dropped == DroppedBackpressure + DroppedDrain
+Failed  == FailedOnline + FailedDrain
+```
+
+| 分类字段 | 含义 |
+|---|---|
+| `DroppedBackpressure` | 缓冲满按策略丢弃（背压扛不住） |
+| `DroppedDrain` | 退订宽限期到期仍未处理完（下线收敛超时），含在途那一条 |
+| `FailedOnline` | 在线期间处理函数返回错误 |
+| `FailedDrain` | 退订宽限期内处理函数返回错误 |
+
+## 优雅下线（退订收敛）
+
+`Unsubscribe` 触发优雅关闭而非立即丢弃：订阅者停止接收新消息后，
+缓冲中排队与正在处理的消息在 `DrainTimeout` 宽限时间内继续处理：
+
+- 宽限期内处理成功计入 `Delivered`（cursor 照常推进）；
+- 宽限期内处理报错计入 `Failed`（分类 `FailedDrain`）；
+- 宽限到期仍未处理完的（**含正在处理的那一条**）计入 `Dropped`（分类 `DroppedDrain`），
+  不会因下线凭空消失；到期后才返回的处理结果不再入账，账目定案后不可篡改。
+
+`DrainTimeout` 边界取值：
+
+| 取值 | 行为 |
+|---|---|
+| `> 0` | 宽限该时长；缓冲排空即提前定案，到期强制收敛 |
+| `== 0` | **无宽限**：退订即刻定案，在途与缓冲消息立即计为 `DroppedDrain` |
+| `< 0` | 未设置/非法，回落到默认值 `DefaultDrainTimeout = 2s` |
+
+## 会话账目与主题聚合（审计）
+
+- `Broker.SessionReport(topic, id)`：查询指定订阅者**最近一次会话**的最终账目
+  （`Stats` 全部分类计数 + 最后确认位置 `Cursor`）。会话下线收敛后仍可查询；
+  落账异步于定案（`Subscriber.Finalized()` 关闭后由后台回调写入），定案后短暂窗口内可轮询等待。
+- `Broker.TopicStats(topic)`：主题维度聚合视角——`Published` 累计发布量，
+  以及所有接入过的订阅者合计的 `Delivered/Dropped/Failed`（含全部分类计数）。
+  聚合范围 = 活跃订阅者 + 收敛中订阅者 + 已离开会话的累计，
+  已离开订阅者的贡献**永久保留**，且退订收敛的任意时刻账目连续、无空窗。
+
+核对口径：对从 0 订阅、覆盖主题全生命周期的单个会话，
+`Published == Delivered + Dropped + Failed` 恒成立；
+多订阅者场景下聚合总量 = 各会话报告逐项之和（每个会话对自己应投的消息集合守恒）。
 
 ## 慢消费者策略（背压）
 
@@ -65,9 +113,21 @@ Source (可控事件源) --> Broker --> topicLog (每主题保序日志, 固定�
 | `RetainPerTopic` | 1024 | 每主题日志保留条数，即可恢复的游标窗口 |
 | `SubscriberBuffer` | 64 | 每订阅者缓冲容量 |
 | `Policy` | `DropNewest` | 缓冲满时的丢弃策略 |
+| `DrainTimeout` | 2s（配负数时回落） | 退订宽限时间；`0` = 立即收敛，`<0` = 取默认值 |
 
 命令行演示参数：`go run ./cmd/gateway -h`
-（`-retain` / `-buffer` / `-n` / `-interval`）。
+（`-retain` / `-buffer` / `-n` / `-interval` / `-drain`）。
+
+## 兼容范围
+
+- `Stats` 原有的 `Delivered/Dropped/Failed` 字段语义不变（仍为总计），
+  新增的分类字段为纯增量，原有守恒不变式与既有用例不受影响。
+- `Unsubscribe` 由「立即关闭」变为「优雅关闭」：退订后订阅者进入收敛流程，
+  残余消息按上述口径入账而非静默消失；`DrainTimeout` 零值（如未显式配置的旧代码）
+  语义为立即收敛，残余消息会被计为 `DroppedDrain`——账目更完整，
+  但与上一版「残余消息不计数」的行为存在可观察差异。
+- 新增 API（`SessionReport` / `TopicStats` / `Subscriber.Finalized` / `Subscriber.Report`）
+  均为纯增量，不影响既有接口。
 
 ## 本地验证
 
@@ -75,11 +135,11 @@ Source (可控事件源) --> Broker --> topicLog (每主题保序日志, 固定�
 # 运行全部测试（含竞态检测）
 go test ./... -race -v
 
-# 运行本地演示：观察快/慢订阅者输出、游标恢复与守恒校验
-go run ./cmd/gateway -n 30 -interval 50ms
+# 运行本地演示：观察快/慢订阅者输出、游标恢复、优雅下线收敛与守恒校验
+go run ./cmd/gateway -n 30 -interval 50ms -drain 2s
 ```
 
-测试覆盖三类场景，日志中打印输入条件与判定依据：
+测试覆盖以下场景，日志中打印输入条件与判定依据：
 
 - `TestConcurrentSubscribeChurn`：8 个订阅者并发增删 + 持续发布，
   常驻订阅者收到的 Seq 必须严格等于 1..N（无重复、无漏投、无乱序）。
@@ -87,3 +147,16 @@ go run ./cmd/gateway -n 30 -interval 50ms
   过期游标返回 `cursor_expired`，越界游标返回 `cursor_regression`。
 - `TestSlowConsumerIsolation`：慢订阅者阻塞期间快订阅者收齐全部消息；
   慢订阅者发生可计数的 `Dropped`；放行后 `Delivered+Dropped+Failed == 发布总数`。
+- `TestGracefulUnsubscribeDrain`：退订后宽限期内积压消息被处理完才定案；
+  定案前账目不可查，定案后 `SessionReport` 可查且 `Delivered`、cursor 符合预期。
+- `TestDrainTimeoutDrops`：handler 卡死时宽限到期强制收敛，
+  在途+缓冲全部计为 `DroppedDrain`；定案后 handler 再返回也不改账。
+- `TestDrainTimeoutZeroAndNegative`：`DrainTimeout=0` 立即收敛；
+  负数回落默认 2s（宽限期内不定案，放行后正常收敛）。
+- `TestDrainFailureClassification`：在线失败计 `FailedOnline`、
+  宽限内失败计 `FailedDrain`，总计与分类自洽。
+- `TestDropReasonSeparation`：同一会话中背压丢弃（`DroppedBackpressure`）
+  与收敛丢弃（`DroppedDrain`）分开计数，合计与发布总量对得上。
+- `TestAggregateConservationUnderChurn`：8×20 个独立会话高频上下线 + 持续发布，
+  全部收敛后 `TopicStats` 聚合 == 161 个 `SessionReport` 逐项之和，
+  常驻会话 `Total == Published`，分类口径全程自洽。
