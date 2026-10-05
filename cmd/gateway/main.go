@@ -15,12 +15,14 @@ func main() {
 	buf := flag.Int("buffer", 8, "每订阅者缓冲容量")
 	total := flag.Int("n", 30, "注入事件总数")
 	interval := flag.Duration("interval", 50*time.Millisecond, "事件注入间隔")
+	drain := flag.Duration("drain", 2*time.Second, "订阅者下线宽限时间（<=0 立即结算）")
 	flag.Parse()
 
 	cfg := gateway.Config{
 		RetainPerTopic:   *retain,
 		SubscriberBuffer: *buf,
 		Policy:           gateway.DropNewest,
+		DrainTimeout:     *drain,
 	}
 	broker := gateway.NewBroker(cfg)
 	src := gateway.NewSource(broker, "orders")
@@ -86,12 +88,35 @@ func main() {
 		time.Sleep(20 * time.Millisecond)
 	}
 	ss := slow.Stats()
-	fmt.Printf("[stats] slow: delivered=%d dropped=%d failed=%d total=%d (published=%d)\n",
-		ss.Delivered, ss.Dropped, ss.Failed, ss.Total(), published)
+	fmt.Printf("[stats] slow: delivered=%d dropped=%d(bp=%d shutdown=%d) failed=%d total=%d (published=%d)\n",
+		ss.Delivered, ss.Dropped, ss.DroppedBackpressure, ss.DroppedShutdown, ss.Failed, ss.Total(), published)
 	if ss.Total() == published {
 		fmt.Println("[done] 守恒校验通过: delivered+dropped+failed == published")
 	} else {
 		fmt.Println("[done] 守恒校验失败!")
+	}
+
+	// 演示优雅下线：slow 退订，缓冲中剩余消息在宽限期内收敛
+	broker.Unsubscribe("orders", "slow")
+	deadline = time.Now().Add(*drain + 2*time.Second)
+	for len(broker.SessionReports("orders", "slow")) == 0 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	for _, rep := range broker.SessionReports("orders", "slow") {
+		fmt.Printf("[audit] 会话账目 sub=%s reason=%s delivered=%d dropped_bp=%d dropped_shutdown=%d failed=%d cursor=%d\n",
+			rep.SubscriberID, rep.Reason, rep.Stats.Delivered, rep.Stats.DroppedBackpressure,
+			rep.Stats.DroppedShutdown, rep.Stats.Failed, rep.Cursor)
+	}
+
+	// 演示按主题聚合的运营视角（含已离开订阅者的贡献）
+	ts := broker.TopicStats("orders")
+	fmt.Printf("[audit] 主题聚合 published=%d dispatched=%d delivered=%d dropped=%d(bp=%d shutdown=%d) failed=%d sessions=%d active=%d\n",
+		ts.Published, ts.Dispatched, ts.Delivered, ts.Dropped, ts.DroppedBackpressure,
+		ts.DroppedShutdown, ts.Failed, ts.Sessions, ts.ActiveSubscribers)
+	if ts.Dispatched == ts.Delivered+ts.Dropped+ts.Failed {
+		fmt.Println("[done] 聚合守恒校验通过: dispatched == delivered+dropped+failed")
+	} else {
+		fmt.Println("[done] 聚合守恒校验失败!")
 	}
 }
 
